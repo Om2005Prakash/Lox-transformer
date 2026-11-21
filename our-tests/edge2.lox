@@ -1,0 +1,8 @@
+var x = "outer";
+var c = true;
+if (c)
+{
+    var x = "inner";
+    print x;
+}
+print x;

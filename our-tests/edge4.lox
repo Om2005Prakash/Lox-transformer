@@ -1,0 +1,4 @@
+var a = "hi";
+var b = "hi";
+var eq = a == b;
+print eq;

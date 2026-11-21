@@ -1,0 +1,11 @@
+var x = "a";
+var y = "b";
+var i = 0;
+var lim = 3;
+var one = 1;
+while (i < lim)
+{
+    x = x + y;
+    i = i + one;
+}
+print x;
