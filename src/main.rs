@@ -27,6 +27,7 @@ enum Op {
     Ge,
 }
 
+// Expression can either just a operand or a binary operation on two operands
 #[derive(Debug, Clone, PartialEq)]
 enum Expr {
     Single(Operand),
@@ -122,21 +123,21 @@ impl SymbolTable {
     }
 }
 
-///////////////////////Algo1
+///////////////////////////TYPE INFERENCE///////////////////////////
 
+// Check possible types of a given operand set
 fn is_all_num(set: &HashSet<Val>) -> bool {
-    !set.is_empty() && set.iter().all(|v| matches!(v, Val::Num))
+    !set.is_empty() && set.iter().all(|v| *v == Val::Num)
 }
-
 fn is_all_bool(set: &HashSet<Val>) -> bool {
-    !set.is_empty() && set.iter().all(|v| matches!(v, Val::Bool))
+    !set.is_empty() && set.iter().all(|v| *v == Val::Num)
 }
-
 fn is_all_str(set: &HashSet<Val>) -> bool {
-    !set.is_empty() && set.iter().all(|v| matches!(v, Val::Alloc(_)))
+    !set.is_empty() && set.iter().all(|v| *v == Val::Num)
 }
 
-fn eval_operand(op: &Operand, state: &ValState, site_id: AllocId) -> Result<HashSet<Val>, String> {
+// Return all possible types of a Operand
+fn eval_operand(op: &Operand, state: &ValState, alloc_id: AllocId) -> Result<HashSet<Val>, String> {
     let mut out = HashSet::new();
     match op {
         Operand::Num(_) => {
@@ -146,7 +147,7 @@ fn eval_operand(op: &Operand, state: &ValState, site_id: AllocId) -> Result<Hash
             out.insert(Val::Bool);
         }
         Operand::Str(_) => {
-            out.insert(Val::Alloc(site_id));
+            out.insert(Val::Alloc(alloc_id));
         }
         Operand::Var { name, id } => match state.get(id) {
             Some(vals) if !vals.is_empty() => return Ok(vals.clone()),
@@ -156,12 +157,13 @@ fn eval_operand(op: &Operand, state: &ValState, site_id: AllocId) -> Result<Hash
     Ok(out)
 }
 
-fn eval_expr(expr: &Expr, state: &ValState, site_id: AllocId) -> Result<HashSet<Val>, String> {
+// Evalaute the type of a expression
+fn eval_expr(expr: &Expr, state: &ValState, alloc_id: AllocId) -> Result<HashSet<Val>, String> {
     match expr {
-        Expr::Single(op) => eval_operand(op, state, site_id),
+        Expr::Single(op) => eval_operand(op, state, alloc_id),
         Expr::Binary { left, op, right } => {
-            let l_set = eval_operand(left, state, site_id)?;
-            let r_set = eval_operand(right, state, site_id)?;
+            let l_set = eval_operand(left, state, alloc_id)?;
+            let r_set = eval_operand(right, state, alloc_id)?;
 
             let mut out = HashSet::new();
             match op {
@@ -169,7 +171,7 @@ fn eval_expr(expr: &Expr, state: &ValState, site_id: AllocId) -> Result<HashSet<
                     if is_all_num(&l_set) && is_all_num(&r_set) {
                         out.insert(Val::Num);
                     } else if is_all_str(&l_set) && is_all_str(&r_set) {
-                        out.insert(Val::Alloc(site_id));
+                        out.insert(Val::Alloc(alloc_id));
                     } else {
                         return Err("Type error: '+' requires two numbers or two strings".to_string());
                     }
@@ -204,6 +206,7 @@ fn eval_expr(expr: &Expr, state: &ValState, site_id: AllocId) -> Result<HashSet<
     }
 }
 
+// Given two states, returns a merged state
 fn merge_states(a: &ValState, b: &ValState) -> ValState {
     let mut merged = a.clone();
     for (var_id, b_vals) in b {
@@ -215,6 +218,7 @@ fn merge_states(a: &ValState, b: &ValState) -> ValState {
     merged
 }
 
+// We also have access of raw line so if the expression is not parsed then give error with the line no
 fn analyze_block(
     stmts: &[Stmt],
     state: &mut ValState,
@@ -244,6 +248,7 @@ fn analyze_block(
                 else_block,
                 ..
             } => {
+                // Site 0 is reserved for bool / Actual allocation id starts from 1
                 let cond_vals = eval_expr(cond, state, 0)?;
                 if !is_all_bool(&cond_vals) {
                     return Err("Type error: 'if' condition must evaluate to bool".to_string());
@@ -268,6 +273,7 @@ fn analyze_block(
             Stmt::While { cond, body, .. } => {
                 let base_alloc = *next_alloc;
                 loop {
+                    // Site 0 is reserved for bool / Actual allocation id starts from 1
                     let cond_vals = eval_expr(cond, state, 0)?;
                     if !is_all_bool(&cond_vals) {
                         return Err("Type error: 'while' condition must evaluate to bool".to_string());
@@ -301,7 +307,7 @@ fn analyze_block(
     Ok(())
 }
 
-///////////////////////Algo2
+///////////////////////////LIVE VAR ANALYSIS///////////////////////////
 
 fn expr_vars(expr: &Expr) -> HashSet<VarId> {
     let mut vars = HashSet::new();
