@@ -1,3 +1,13 @@
-var x = "abc";
-x = x + x;
-print x;
+var n = 0;
+input n;
+var m = 4;
+var a = "Yello";
+var b = "hellp";
+var c = "pello";
+if (c == b)
+{
+a = c;
+b = a + a;
+}
+b = c;
+print c;

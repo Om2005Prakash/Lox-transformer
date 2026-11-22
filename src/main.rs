@@ -395,17 +395,9 @@ fn compute_liveness(
                 for v in expr_vars(cond) {
                     head_live.insert(v);
                 }
-                loop {
-                    let (body_in, _) = compute_liveness(body, &head_live);
-                    let mut changed = false;
-                    for v in body_in {
-                        if head_live.insert(v) {
-                            changed = true;
-                        }
-                    }
-                    if !changed {
-                        break;
-                    }
+                let (body_in, _) = compute_liveness(body, &head_live);
+                for v in body_in {
+                    head_live.insert(v);
                 }
                 cur_live = head_live;
             }
@@ -473,7 +465,6 @@ fn collect_alias_groups(
             return Err("Branch leaves an unreachable string allocated".to_string());
         }
 
-        // The same variables must form the same key, regardless of iteration order
         aliases.sort_unstable();
         groups.insert(aliases, alloc_id);
     }
@@ -875,31 +866,73 @@ fn emit_block(
                 for v in expr_vars(cond) {
                     head_live.insert(v);
                 }
-                loop {
-                    let (body_in, _) = compute_liveness(body, &head_live);
-                    let mut changed = false;
-                    for v in body_in {
-                        if head_live.insert(v) {
-                            changed = true;
-                        }
-                    }
-                    if !changed {
-                        break;
-                    }
+                let (body_in, _) = compute_liveness(body, &head_live);
+                for v in body_in {
+                    head_live.insert(v);
                 }
 
-                let header_alive = live_allocs(&loop_state, &head_live);
-                if head_live.iter().any(|id| {
-                    let vals = loop_state.get(id);
-                    vals.is_some_and(|vals| vals.iter().any(|v| matches!(v, Val::Alloc(_))))
-                        && vals != state.get(id)
-                }) {
-                    return Err("Cannot prove loop-carried string aliases stable across iterations".into());
+                let mut header_alive = live_allocs(&loop_state, &head_live);
+                let has_stable_owner = |alloc_id: AllocId| {
+                    in_scope.iter().any(|&owner_id| {
+                        let visible = in_scope
+                            .iter()
+                            .rev()
+                            .find(|&&other| id_to_name[other] == id_to_name[owner_id])
+                            == Some(&owner_id);
+                        let before = state.get(&owner_id);
+                        let after = loop_state.get(&owner_id);
+
+                        visible
+                            && before == after
+                            && before.is_some_and(|vals| {
+                                vals.len() == 1 && vals.contains(&Val::Alloc(alloc_id))
+                            })
+                    })
+                };
+
+                let has_unsafe_alias_change = head_live.iter().any(|id| {
+                    match loop_state.get(id) {
+                        Some(vals) if Some(vals) != state.get(id) => vals.iter().any(|val| {
+                            matches!(val, Val::Alloc(a) if !has_stable_owner(*a))
+                        }),
+                        _ => false,
+                    }
+                });
+
+                let mut uses_memory_join = false;
+                let mut body_alloc = base_alloc;
+                if has_unsafe_alias_change {
+                    let mut first_body_state = state.clone();
+                    let mut first_body_alloc = base_alloc;
+                    analyze_block(body, &mut first_body_state, &mut first_body_alloc)?;
+                    let entry_alive = live_allocs(state, &head_live);
+                    let first_body_alive = live_allocs(&first_body_state, &head_live);
+                    let (joined_state, joined_alive) = join_memory(
+                        state,
+                        &first_body_state,
+                        &entry_alive,
+                        &first_body_alive,
+                        &head_live,
+                        next_alloc,
+                    )
+                    .map_err(|_| {
+                        "Cannot prove loop-carried string aliases stable across iterations"
+                            .to_string()
+                    })?;
+
+                    for (id, vals) in joined_state {
+                        if vals.iter().any(|val| matches!(val, Val::Alloc(_))) {
+                            loop_state.insert(id, vals);
+                        }
+                    }
+                    header_alive = joined_alive;
+                    uses_memory_join = true;
+                    body_alloc = *next_alloc;
                 }
                 let mut body_state = loop_state.clone();
                 let mut body_scope = in_scope.clone();
                 let mut body_lines = Vec::new();
-                *next_alloc = base_alloc;
+                *next_alloc = body_alloc;
                 let body_end_alive = emit_block(
                     body,
                     &mut body_state,
@@ -912,7 +945,22 @@ fn emit_block(
                     &mut body_lines,
                 )?;
 
-                if body_end_alive != header_alive {
+                if uses_memory_join {
+                    let (joined_state, joined_alive) = join_memory(
+                        &loop_state,
+                        &body_state,
+                        &header_alive,
+                        &body_end_alive,
+                        &head_live,
+                        next_alloc,
+                    )?;
+                    for (id, vals) in joined_state {
+                        if vals.iter().any(|val| matches!(val, Val::Alloc(_))) {
+                            loop_state.insert(id, vals);
+                        }
+                    }
+                    header_alive = joined_alive;
+                } else if body_end_alive != header_alive {
                     return Err("Loop iteration leaks or double-frees heap strings".to_string());
                 }
 
@@ -1309,7 +1357,7 @@ fn main() {
                 },
                 None => "output",
             };
-            let output_path = input_path.with_file_name(format!("{}_o.rs", stem));
+            let output_path = input_path.with_file_name(format!("{}_o.lox", stem));
 
             if let Err(err) = fs::write(&output_path, output_code) {
                 eprintln!("Error writing '{}': {}", output_path.display(), err);

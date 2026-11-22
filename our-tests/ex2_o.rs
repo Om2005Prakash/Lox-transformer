@@ -1,5 +1,0 @@
-var x = "";
-var y = x;
-print x;
-print y;
-drop y;
