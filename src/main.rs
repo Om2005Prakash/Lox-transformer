@@ -130,10 +130,10 @@ fn is_all_num(set: &HashSet<Val>) -> bool {
     !set.is_empty() && set.iter().all(|v| *v == Val::Num)
 }
 fn is_all_bool(set: &HashSet<Val>) -> bool {
-    !set.is_empty() && set.iter().all(|v| *v == Val::Num)
+    !set.is_empty() && set.iter().all(|v| *v == Val::Bool)
 }
 fn is_all_str(set: &HashSet<Val>) -> bool {
-    !set.is_empty() && set.iter().all(|v| *v == Val::Num)
+    !set.is_empty() && set.iter().all(|v| matches!(v, Val::Alloc(_)))
 }
 
 // Return all possible types of a Operand
@@ -219,6 +219,7 @@ fn merge_states(a: &ValState, b: &ValState) -> ValState {
 }
 
 // We also have access of raw line so if the expression is not parsed then give error with the line no
+// remove this comment
 fn analyze_block(
     stmts: &[Stmt],
     state: &mut ValState,
@@ -309,6 +310,7 @@ fn analyze_block(
 
 ///////////////////////////LIVE VAR ANALYSIS///////////////////////////
 
+// Returns the ids of variables referenced in a expression
 fn expr_vars(expr: &Expr) -> HashSet<VarId> {
     let mut vars = HashSet::new();
     match expr {
@@ -328,6 +330,7 @@ fn expr_vars(expr: &Expr) -> HashSet<VarId> {
     vars
 }
 
+// Returns the ids reachable through given set of live variables.
 fn live_allocs(state: &ValState, live_vars: &HashSet<VarId>) -> HashSet<AllocId> {
     let mut allocs = HashSet::new();
     for var_id in live_vars {
@@ -342,6 +345,7 @@ fn live_allocs(state: &ValState, live_vars: &HashSet<VarId>) -> HashSet<AllocId>
     allocs
 }
 
+// Computes variables live before the block and immediately after each statement
 fn compute_liveness(
     stmts: &[Stmt],
     live_after: &HashSet<VarId>,
@@ -413,6 +417,7 @@ fn compute_liveness(
     (cur_live, live_after_each)
 }
 
+// Finds an in-scope variable that uniquely owns the specified allocation
 fn find_drop_target(
     alloc_id: AllocId,
     state: &ValState,
@@ -441,10 +446,12 @@ fn find_drop_target(
     Err("Cannot statically determine a single variable to drop heap string".to_string())
 }
 
+// Produces the indentation string
 fn indent_str(indent: usize) -> String {
     "    ".repeat(indent)
 }
 
+// Emits a transformed block with safe drop statements for heap strings
 fn emit_block(
     stmts: &[Stmt],
     state: &mut ValState,
@@ -845,11 +852,26 @@ fn emit_block(
             }
         }
     }
+    let needed_after_block = live_allocs(state, live_after_block);
+    let pad = indent_str(indent);
+    let mut to_drop: Vec<AllocId> = Vec::new();
+    for &a in &currently_alive {
+        if !needed_after_block.contains(&a) {
+            to_drop.push(a);
+        }
+    }
+    to_drop.sort();
+    for a in to_drop {
+        let target = find_drop_target(a, state, in_scope, None, id_to_name)?;
+        out_lines.push(format!("{}drop {};", pad, target));
+        currently_alive.remove(&a);
+    }
 
     Ok(currently_alive)
 }
 
 
+// Removes a line comment while preserving comment markers inside strings
 fn strip_comment(line: &str) -> String {
     let chars: Vec<char> = line.chars().collect();
     let mut in_quotes = false;
@@ -869,6 +891,7 @@ fn strip_comment(line: &str) -> String {
     out
 }
 
+// Parses a literal or variable reference into an operand
 fn parse_operand(raw: &str, symtab: &SymbolTable) -> Result<Operand, String> {
     let s = raw.trim();
     if s.starts_with('"') && s.ends_with('"') && s.len() >= 2 {
@@ -892,6 +915,7 @@ fn parse_operand(raw: &str, symtab: &SymbolTable) -> Result<Operand, String> {
     })
 }
 
+// Parses a single-operand or binary expression
 fn parse_expr(raw: &str, symtab: &SymbolTable) -> Result<Expr, String> {
     let s = raw.trim();
     let chars: Vec<char> = s.chars().collect();
@@ -949,6 +973,7 @@ fn parse_expr(raw: &str, symtab: &SymbolTable) -> Result<Expr, String> {
     Ok(Expr::Single(operand))
 }
 
+// Extracts the expression enclosed in a control-flow header's parentheses
 fn get_condition(header: &str) -> Result<String, String> {
     let open = match header.find('(') {
         Some(idx) => idx,
@@ -964,6 +989,7 @@ fn get_condition(header: &str) -> Result<String, String> {
     Ok(header[open + 1..close].trim().to_string())
 }
 
+// Checks whether a line begins with a complete keyword token.
 fn starts_with_kw(line: &str, kw: &str) -> bool {
     if !line.starts_with(kw) {
         return false;
@@ -972,6 +998,7 @@ fn starts_with_kw(line: &str, kw: &str) -> bool {
     rest.is_empty() || rest.starts_with(' ') || rest.starts_with('(')
 }
 
+// Normalizes and parses source text into statements and variable names
 fn parse_program(source: &str) -> Result<(Vec<Stmt>, Vec<String>), String> {
     let mut lines: Vec<String> = Vec::new();
 
@@ -986,20 +1013,30 @@ fn parse_program(source: &str) -> Result<(Vec<Stmt>, Vec<String>), String> {
             lines.push("}".to_string());
             lines.push("else".to_string());
             lines.push("{".to_string());
-        } else if cleaned.ends_with('{') && cleaned.len() > 1 {
-            let before = cleaned[..cleaned.len() - 1].trim();
-            lines.push(before.to_string());
-            lines.push("{".to_string());
         } else if cleaned.starts_with('}') && cleaned.len() > 1 {
             lines.push("}".to_string());
             let after = cleaned[1..].trim();
-            if after.ends_with('{') && after.len() > 1 {
+            if after.ends_with("{}") && after.len() > 2 {
+                let mid = after[..after.len() - 2].trim();
+                lines.push(mid.to_string());
+                lines.push("{".to_string());
+                lines.push("}".to_string());
+            } else if after.ends_with('{') && after.len() > 1 {
                 let mid = after[..after.len() - 1].trim();
                 lines.push(mid.to_string());
                 lines.push("{".to_string());
             } else {
                 lines.push(after.to_string());
             }
+        } else if cleaned.ends_with("{}") && cleaned.len() > 2 {
+            let before = cleaned[..cleaned.len() - 2].trim();
+            lines.push(before.to_string());
+            lines.push("{".to_string());
+            lines.push("}".to_string());
+        } else if cleaned.ends_with('{') && cleaned.len() > 1 {
+            let before = cleaned[..cleaned.len() - 1].trim();
+            lines.push(before.to_string());
+            lines.push("{".to_string());
         } else {
             lines.push(cleaned.to_string());
         }
@@ -1011,6 +1048,7 @@ fn parse_program(source: &str) -> Result<(Vec<Stmt>, Vec<String>), String> {
     Ok((stmts, symtab.id_to_name))
 }
 
+// Parses statements until the input ends or the current block closes
 fn parse_stmt_list(
     lines: &[String],
     pos: &mut usize,
@@ -1155,6 +1193,7 @@ fn parse_stmt_list(
     Ok(stmts)
 }
 
+// Reads the input program, transforms it, and writes the generated output file
 fn main() {
     let args: Vec<String> = env::args().collect();
     if args.len() != 2 {
@@ -1180,7 +1219,7 @@ fn main() {
                 },
                 None => "output",
             };
-            let output_path = input_path.with_file_name(format!("{}_o.rs", stem));
+            let output_path = input_path.with_file_name(format!("{}_o.lox", stem));
 
             if let Err(err) = fs::write(&output_path, output_code) {
                 eprintln!("Error writing '{}': {}", output_path.display(), err);
@@ -1195,6 +1234,7 @@ fn main() {
     }
 }
 
+// Analyzes and emits a transformed Lox program with explicit string drops
 fn transform_lox(source: &str) -> Result<String, String> {
     let (stmts, id_to_name) = parse_program(source)?;
 
