@@ -417,25 +417,19 @@ fn compute_liveness(
     (cur_live, live_after_each)
 }
 
-// Finds an in-scope variable that uniquely owns the specified allocation
+// Finds a visible variable that refers to the specified allocation
 fn find_drop_target(
     alloc_id: AllocId,
     state: &ValState,
     in_scope: &[VarId],
-    preferred: Option<VarId>,
     id_to_name: &[String],
 ) -> Result<String, String> {
-    if let Some(pref_id) = preferred {
-        if in_scope.contains(&pref_id) {
-            if let Some(vals) = state.get(&pref_id) {
-                if vals.len() == 1 && vals.contains(&Val::Alloc(alloc_id)) {
-                    return Ok(id_to_name[pref_id].clone());
-                }
-            }
-        }
-    }
+    let visible = |id: VarId| {
+        in_scope.iter().rev().find(|&&other| id_to_name[other] == id_to_name[id]) == Some(&id)
+    };
 
     for &var_id in in_scope {
+        if !visible(var_id) { continue; }
         if let Some(vals) = state.get(&var_id) {
             if vals.len() == 1 && vals.contains(&Val::Alloc(alloc_id)) {
                 return Ok(id_to_name[var_id].clone());
@@ -449,6 +443,74 @@ fn find_drop_target(
 // Produces the indentation string
 fn indent_str(indent: usize) -> String {
     "    ".repeat(indent)
+}
+
+// Groups alternative strings only when the same live variables alias them on both paths.
+fn join_memory(
+    then_state: &ValState, else_state: &ValState,
+    then_alive: &HashSet<AllocId>, else_alive: &HashSet<AllocId>,
+    live: &HashSet<VarId>, next_alloc: &mut AllocId,
+) -> Result<(ValState, HashSet<AllocId>), String> {
+    let groups = |state: &ValState, alive: &HashSet<AllocId>| {
+        let mut groups = HashMap::new();
+        for &a in alive {
+            let mut aliases = Vec::new();
+            for &id in live {
+                if let Some(vals) = state.get(&id) {
+                    if vals.contains(&Val::Alloc(a)) {
+                        if vals.len() != 1 {
+                            return Err("Cannot prove a string reference valid on every branch".to_string());
+                        }
+                        aliases.push(id);
+                    }
+                }
+            }
+            aliases.sort_unstable();
+            if aliases.is_empty() {
+                return Err("Branch leaves an unreachable string allocated".to_string());
+            }
+            groups.insert(aliases, a);
+        }
+        Ok(groups)
+    };
+    let left = groups(then_state, then_alive)?;
+    let right = groups(else_state, else_alive)?;
+    if left.len() != right.len() || left.keys().any(|key| !right.contains_key(key)) {
+        return Err("Cannot safely balance string aliases across if/else branches".into());
+    }
+    let mut joined = merge_states(then_state, else_state);
+    // Dead aliases must not keep pointing at an identity replaced by a branch join.
+    joined.retain(|id, _| live.contains(id));
+    let mut alive = HashSet::new();
+    let mut keys: Vec<_> = left.keys().collect();
+    keys.sort();
+    for aliases in keys {
+        let a = if left[aliases] == right[aliases] {
+            left[aliases]
+        } else {
+            let a = *next_alloc;
+            *next_alloc += 1;
+            a
+        };
+        alive.insert(a);
+        for &id in aliases {
+            joined.insert(id, HashSet::from([Val::Alloc(a)]));
+        }
+    }
+    Ok((joined, alive))
+}
+
+// Adjacent drops share the following expression's evaluation point
+fn emit_drop(out: &mut Vec<String>, pad: &str, target: &str) {
+    let prefix = format!("{}drop ", pad);
+    if let Some(last) = out.last_mut() {
+        if last.starts_with(&prefix) && last.ends_with(';') {
+            last.pop();
+            last.push_str(&format!(", {};", target));
+            return;
+        }
+    }
+    out.push(format!("{}{};", prefix, target));
 }
 
 // Emits a transformed block with safe drop statements for heap strings
@@ -499,8 +561,8 @@ fn emit_block(
                 }
                 to_drop.sort();
                 for a in to_drop {
-                    let target = find_drop_target(a, state, in_scope, Some(*id), id_to_name)?;
-                    out_lines.push(format!("{}drop {};", pad, target));
+                    let target = find_drop_target(a, state, in_scope, id_to_name)?;
+                    emit_drop(out_lines, &pad, &target);
                     currently_alive.remove(&a);
                 }
             }
@@ -531,7 +593,7 @@ fn emit_block(
                             Val::Alloc(old_a) => {
                                 if currently_alive.contains(old_a) {
                                     has_live_alloc = true;
-                                    if needed_after.contains(old_a) {
+                                    if needed_after.contains(old_a) || new_vals.contains(&Val::Alloc(*old_a)) {
                                         any_still_aliased = true;
                                     } else {
                                         any_dying = true;
@@ -551,7 +613,7 @@ fn emit_block(
                                 name
                             ));
                         }
-                        out_lines.push(format!("{}drop {};", pad, name));
+                        emit_drop(out_lines, &pad, name);
                         for val in old_vals {
                             if let Val::Alloc(old_a) = val {
                                 currently_alive.remove(old_a);
@@ -577,8 +639,8 @@ fn emit_block(
                 }
                 to_drop.sort();
                 for a in to_drop {
-                    let target = find_drop_target(a, state, in_scope, None, id_to_name)?;
-                    out_lines.push(format!("{}drop {};", pad, target));
+                    let target = find_drop_target(a, state, in_scope, id_to_name)?;
+                    emit_drop(out_lines, &pad, &target);
                     currently_alive.remove(&a);
                 }
             }
@@ -623,7 +685,7 @@ fn emit_block(
                                 name
                             ));
                         }
-                        out_lines.push(format!("{}drop {};", pad, name));
+                        emit_drop(out_lines, &pad, name);
                         for val in old_vals {
                             if let Val::Alloc(old_a) = val {
                                 currently_alive.remove(old_a);
@@ -638,15 +700,13 @@ fn emit_block(
             Stmt::Print { expr, raw_line } => {
                 let site = *next_alloc;
                 *next_alloc += 1;
-                let _ = eval_expr(expr, state, site)?;
+                let vals = eval_expr(expr, state, site)?;
+                if vals.contains(&Val::Alloc(site)) {
+                    return Err("Cannot drop an unnamed string result in print; assign it to a variable first".into());
+                }
                 let needed_after = live_allocs(state, live_after);
 
                 out_lines.push(format!("{}{}", pad, raw_line));
-
-                let mut pref = None;
-                if let Expr::Single(Operand::Var { id, .. }) = expr {
-                    pref = Some(*id);
-                }
 
                 let mut to_drop: Vec<AllocId> = Vec::new();
                 for &a in &currently_alive {
@@ -656,8 +716,8 @@ fn emit_block(
                 }
                 to_drop.sort();
                 for a in to_drop {
-                    let target = find_drop_target(a, state, in_scope, pref, id_to_name)?;
-                    out_lines.push(format!("{}drop {};", pad, target));
+                    let target = find_drop_target(a, state, in_scope, id_to_name)?;
+                    emit_drop(out_lines, &pad, &target);
                     currently_alive.remove(&a);
                 }
             }
@@ -693,7 +753,6 @@ fn emit_block(
                     }
                 }
 
-                let alloc_checkpoint = *next_alloc;
                 let mut then_state = state.clone();
                 let mut then_scope = in_scope.clone();
                 let mut then_lines = Vec::new();
@@ -709,7 +768,6 @@ fn emit_block(
                     &mut then_lines,
                 )?;
 
-                *next_alloc = alloc_checkpoint;
                 let mut else_state = state.clone();
                 let mut else_scope = in_scope.clone();
                 let mut else_lines = Vec::new();
@@ -730,11 +788,10 @@ fn emit_block(
                     &mut else_lines,
                 )?;
 
-                if then_alive_end != else_alive_end {
-                    return Err(
-                        "Cannot balance heap string lifetimes across if/else branches".to_string(),
-                    );
-                }
+                let (joined, joined_alive) = join_memory(
+                    &then_state, &else_state, &then_alive_end, &else_alive_end,
+                    live_after, next_alloc,
+                )?;
 
                 out_lines.push(format!("{}{}", pad, cond_line));
                 out_lines.push(format!("{}{{", pad));
@@ -752,13 +809,8 @@ fn emit_block(
                     out_lines.push(format!("{}}}", pad));
                 }
 
-                let joined = merge_states(&then_state, &else_state);
-                for &k in in_scope.iter() {
-                    if let Some(v) = joined.get(&k) {
-                        state.insert(k, v.clone());
-                    }
-                }
-                currently_alive = then_alive_end;
+                *state = joined;
+                currently_alive = joined_alive;
             }
             Stmt::While {
                 cond,
@@ -807,9 +859,17 @@ fn emit_block(
                 }
 
                 let header_alive = live_allocs(&loop_state, &head_live);
+                if head_live.iter().any(|id| {
+                    let vals = loop_state.get(id);
+                    vals.is_some_and(|vals| vals.iter().any(|v| matches!(v, Val::Alloc(_))))
+                        && vals != state.get(id)
+                }) {
+                    return Err("Cannot prove loop-carried string aliases stable across iterations".into());
+                }
                 let mut body_state = loop_state.clone();
                 let mut body_scope = in_scope.clone();
                 let mut body_lines = Vec::new();
+                *next_alloc = base_alloc;
                 let body_end_alive = emit_block(
                     body,
                     &mut body_state,
@@ -845,8 +905,8 @@ fn emit_block(
                 }
                 to_drop.sort();
                 for a in to_drop {
-                    let target = find_drop_target(a, state, in_scope, None, id_to_name)?;
-                    out_lines.push(format!("{}drop {};", pad, target));
+                    let target = find_drop_target(a, state, in_scope, id_to_name)?;
+                    emit_drop(out_lines, &pad, &target);
                     currently_alive.remove(&a);
                 }
             }
@@ -862,8 +922,8 @@ fn emit_block(
     }
     to_drop.sort();
     for a in to_drop {
-        let target = find_drop_target(a, state, in_scope, None, id_to_name)?;
-        out_lines.push(format!("{}drop {};", pad, target));
+        let target = find_drop_target(a, state, in_scope, id_to_name)?;
+        emit_drop(out_lines, &pad, &target);
         currently_alive.remove(&a);
     }
 
@@ -871,7 +931,7 @@ fn emit_block(
 }
 
 
-// Removes a line comment while preserving comment markers inside strings
+// Removes a line comment
 fn strip_comment(line: &str) -> String {
     let chars: Vec<char> = line.chars().collect();
     let mut in_quotes = false;
@@ -989,7 +1049,7 @@ fn get_condition(header: &str) -> Result<String, String> {
     Ok(header[open + 1..close].trim().to_string())
 }
 
-// Checks whether a line begins with a complete keyword token.
+// Checks whether a line begins with a complete keyword token
 fn starts_with_kw(line: &str, kw: &str) -> bool {
     if !line.starts_with(kw) {
         return false;
@@ -1219,7 +1279,7 @@ fn main() {
                 },
                 None => "output",
             };
-            let output_path = input_path.with_file_name(format!("{}_o.lox", stem));
+            let output_path = input_path.with_file_name(format!("{}_o.rs", stem));
 
             if let Err(err) = fs::write(&output_path, output_code) {
                 eprintln!("Error writing '{}': {}", output_path.display(), err);
@@ -1264,5 +1324,54 @@ fn transform_lox(source: &str) -> Result<String, String> {
         Ok(String::new())
     } else {
         Ok(format!("{}\n", out_lines.join("\n")))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn example_three_keeps_one_string_per_branch() {
+        let output = transform_lox(include_str!("../our-tests/ex3.lox")).unwrap();
+        assert!(output.contains("    drop y;\n    y=x;"));
+        assert!(output.contains("else\n{\n    drop x;\n}"));
+        assert!(output.ends_with("print y;\ndrop y;\n"));
+    }
+
+    #[test]
+    fn self_assignment_drops_only_once() {
+        assert_eq!(transform_lox("var x = \"hello\";\nx = x;\n").unwrap(),
+            "var x = \"hello\";\nx = x;\ndrop x;\n");
+    }
+
+    #[test]
+    fn unnamed_concatenation_is_rejected() {
+        assert!(transform_lox("var x = \"a\";\nvar y = \"b\";\nprint x + y;\n")
+            .unwrap_err().contains("unnamed string"));
+    }
+
+    #[test]
+    fn shadowed_outer_name_is_not_a_drop_target() {
+        let output = transform_lox("var x = \"outer\";\nvar y = x;\nif (x == y)\n{\nvar x = \"inner\";\nprint x;\n}\n").unwrap();
+        assert!(output.contains("var x = \"inner\";\n    drop y;\n    print x;\n    drop x;"));
+    }
+
+    #[test]
+    fn incompatible_aliases_after_branch_are_rejected() {
+        let source = "var x = \"a\";\nvar y = \"b\";\nvar c = true;\nif (c)\n{\ny = x;\n}\nprint y;\nprint x;\n";
+        assert!(transform_lox(source).unwrap_err().contains("aliases across"));
+    }
+
+    #[test]
+    fn loop_local_strings_are_freed_inside_loop() {
+        let source = "var i = 0;\nvar n = 3;\nvar one = 1;\nwhile (i < n)\n{\nvar s = \"hello\";\nprint s;\ni = i + one;\n}\n";
+        let output = transform_lox(source).unwrap();
+        assert!(output.contains("    print s;\n    drop s;\n    i = i + one;"));
+    }
+
+    #[test]
+    fn uncertain_loop_strings_are_rejected() {
+        assert!(transform_lox(include_str!("../our-tests/edge5.lox")).is_err());
     }
 }
