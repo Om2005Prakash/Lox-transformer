@@ -218,8 +218,6 @@ fn merge_states(a: &ValState, b: &ValState) -> ValState {
     merged
 }
 
-// We also have access of raw line so if the expression is not parsed then give error with the line no
-// remove this comment
 fn analyze_block(
     stmts: &[Stmt],
     state: &mut ValState,
@@ -445,59 +443,91 @@ fn indent_str(indent: usize) -> String {
     "    ".repeat(indent)
 }
 
-// Groups alternative strings only when the same live variables alias them on both paths.
-fn join_memory(
-    then_state: &ValState, else_state: &ValState,
-    then_alive: &HashSet<AllocId>, else_alive: &HashSet<AllocId>,
-    live: &HashSet<VarId>, next_alloc: &mut AllocId,
-) -> Result<(ValState, HashSet<AllocId>), String> {
-    let groups = |state: &ValState, alive: &HashSet<AllocId>| {
-        let mut groups = HashMap::new();
-        for &a in alive {
-            let mut aliases = Vec::new();
-            for &id in live {
-                if let Some(vals) = state.get(&id) {
-                    if vals.contains(&Val::Alloc(a)) {
-                        if vals.len() != 1 {
-                            return Err("Cannot prove a string reference valid on every branch".to_string());
-                        }
-                        aliases.push(id);
-                    }
-                }
+// Maps each sorted list of live aliases to the allocation they share
+fn collect_alias_groups(
+    state: &ValState,
+    alive_allocs: &HashSet<AllocId>,
+    live_vars: &HashSet<VarId>,
+) -> Result<HashMap<Vec<VarId>, AllocId>, String> {
+    let mut groups = HashMap::new();
+
+    for &alloc_id in alive_allocs {
+        let mut aliases = Vec::new();
+
+        for &var_id in live_vars {
+            let values = match state.get(&var_id) {
+                Some(values) => values,
+                None => continue,
+            };
+
+            if !values.contains(&Val::Alloc(alloc_id)) {
+                continue;
             }
-            aliases.sort_unstable();
-            if aliases.is_empty() {
-                return Err("Branch leaves an unreachable string allocated".to_string());
+            if values.len() != 1 {
+                return Err("Cannot prove a string reference valid on every branch".to_string());
             }
-            groups.insert(aliases, a);
+            aliases.push(var_id);
         }
-        Ok(groups)
-    };
-    let left = groups(then_state, then_alive)?;
-    let right = groups(else_state, else_alive)?;
-    if left.len() != right.len() || left.keys().any(|key| !right.contains_key(key)) {
+
+        if aliases.is_empty() {
+            return Err("Branch leaves an unreachable string allocated".to_string());
+        }
+
+        // The same variables must form the same key, regardless of iteration order
+        aliases.sort_unstable();
+        groups.insert(aliases, alloc_id);
+    }
+
+    Ok(groups)
+}
+
+// Joins branches when the same live variables share strings on both paths
+fn join_memory(
+    then_state: &ValState,
+    else_state: &ValState,
+    then_alive: &HashSet<AllocId>,
+    else_alive: &HashSet<AllocId>,
+    live_vars: &HashSet<VarId>,
+    next_alloc: &mut AllocId,
+) -> Result<(ValState, HashSet<AllocId>), String> {
+    let then_groups = collect_alias_groups(then_state, then_alive, live_vars)?;
+    let else_groups = collect_alias_groups(else_state, else_alive, live_vars)?;
+
+    // Both branches must have exactly the same alias groups.
+    if then_groups.len() != else_groups.len() {
         return Err("Cannot safely balance string aliases across if/else branches".into());
     }
-    let mut joined = merge_states(then_state, else_state);
-    // Dead aliases must not keep pointing at an identity replaced by a branch join.
-    joined.retain(|id, _| live.contains(id));
-    let mut alive = HashSet::new();
-    let mut keys: Vec<_> = left.keys().collect();
-    keys.sort();
-    for aliases in keys {
-        let a = if left[aliases] == right[aliases] {
-            left[aliases]
-        } else {
-            let a = *next_alloc;
-            *next_alloc += 1;
-            a
-        };
-        alive.insert(a);
-        for &id in aliases {
-            joined.insert(id, HashSet::from([Val::Alloc(a)]));
+    for aliases in then_groups.keys() {
+        if !else_groups.contains_key(aliases) {
+            return Err("Cannot safely balance string aliases across if/else branches".into());
         }
     }
-    Ok((joined, alive))
+
+    let mut joined_state = merge_states(then_state, else_state);
+    joined_state.retain(|var_id, _| live_vars.contains(var_id));
+    let mut joined_alive = HashSet::new();
+
+    let mut alias_groups: Vec<_> = then_groups.keys().collect();
+    alias_groups.sort();
+
+    for aliases in alias_groups {
+        let then_alloc = then_groups[aliases];
+        let else_alloc = else_groups[aliases];
+        let mut joined_alloc = then_alloc;
+
+        // Different branch allocations get one shared analysis label
+        if then_alloc != else_alloc {
+            joined_alloc = *next_alloc;
+            *next_alloc += 1;
+        }
+
+        joined_alive.insert(joined_alloc);
+        for &var_id in aliases {
+            joined_state.insert(var_id, HashSet::from([Val::Alloc(joined_alloc)]));
+        }
+    }
+
+    Ok((joined_state, joined_alive))
 }
 
 // Adjacent drops share the following expression's evaluation point
